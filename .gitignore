@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+.idea/
+.vscode/
+
+.ipynb_checkpoints/
+notebooks/optuna/cache/
+notebooks/optuna/*.prof
+
+# Local tractography data (keep only the directory itself in Git)
+notebooks/bundles/*
+!notebooks/bundles/.gitkeep
+
+*.log
