@@ -12,4 +12,7 @@ notebooks/optuna/*.prof
 notebooks/bundles/*
 !notebooks/bundles/.gitkeep
 
+# Generated centroid exports
+notebooks/centroids_export/
+
 *.log
