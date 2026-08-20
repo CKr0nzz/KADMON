@@ -7,8 +7,8 @@ from typing import Any
 def reid_selection_key(trial: Any) -> tuple[float, float, float, float]:
     """Ordonner un essai par Top-1, rang, ratio, puis couverture.
 
-    La clé est destinée à ``min`` : le Top-1 et la masse transportée sont donc
-    inversés, tandis que le rang et le ratio sont minimisés directement.
+    La clé est destinée à ``max`` : le Top-1 et la masse transportée sont
+    maximisés directement, tandis que le rang et le ratio sont inversés.
     """
     attributes = trial.user_attrs
     required = (
@@ -22,11 +22,12 @@ def reid_selection_key(trial: Any) -> tuple[float, float, float, float]:
         raise ValueError(
             f"L'essai {getattr(trial, 'number', '?')} ne contient pas : {missing}."
         )
+    # max() favorise Top-1/masse élevés, avec le "-", rang/ratio faibles.
     return (
-        -float(attributes["intra_identity_top1_accuracy"]),
-        float(attributes["mean_intra_identity_rank"]),
-        float(attributes["mean_intra_inter_ratio"]),
-        -float(attributes["mean_transported_mass"]),
+        float(attributes["intra_identity_top1_accuracy"]),
+        -float(attributes["mean_intra_identity_rank"]),
+        -float(attributes["mean_intra_inter_ratio"]),
+        float(attributes["mean_transported_mass"]),
     )
 
 
@@ -40,4 +41,4 @@ def select_best_reid_trial(trials: Iterable[Any]) -> Any:
     ]
     if not completed:
         raise ValueError("Aucun essai Optuna COMPLETE n'est disponible.")
-    return min(completed, key=reid_selection_key)
+    return max(completed, key=reid_selection_key)
