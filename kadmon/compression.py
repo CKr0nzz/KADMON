@@ -86,14 +86,39 @@ def compress_kmeans(
         previous_centroids = centroids.copy()
         assigned_centroid_ids, oriented_bundle = _assign_to_centroids(bundle, centroids)
 
-        for centroid_id in range(n_clusters):
-            member_indices = np.flatnonzero(assigned_centroid_ids == centroid_id)
+        # Ancienne version avec une boucle Python sur chaque cluster :
+        # for centroid_id in range(n_clusters):
+        #     member_indices = np.flatnonzero(
+        #         assigned_centroid_ids == centroid_id
+        #     )
+        #
+        #     if member_indices.size > 0:
+        #         centroids[centroid_id] = oriented_bundle[
+        #             member_indices
+        #         ].mean(axis=0)
+        #     else:
+        #         random_index = rng.integers(n_streamlines)
+        #         centroids[centroid_id] = bundle[random_index]
 
-            if member_indices.size > 0:
-                centroids[centroid_id] = oriented_bundle[member_indices].mean(axis=0)
-            else:
-                random_index = rng.integers(n_streamlines)
-                centroids[centroid_id] = bundle[random_index]
+        cluster_counts = np.bincount(assigned_centroid_ids, minlength=n_clusters)
+        centroid_sums = np.zeros_like(centroids)
+        np.add.at(centroid_sums, assigned_centroid_ids, oriented_bundle)
+
+
+        # Masks
+        non_empty_clusters = cluster_counts > 0
+        empty_clusters = cluster_counts == 0
+
+        # NumPy compare les dimensions en partant de la droite
+        centroids[non_empty_clusters] = (
+            centroid_sums[non_empty_clusters]
+            / cluster_counts[non_empty_clusters, np.newaxis, np.newaxis]
+        )
+
+        n_empty_clusters = np.count_nonzero(empty_clusters)
+        if n_empty_clusters:
+            random_indices = rng.integers(n_streamlines, size=n_empty_clusters)
+            centroids[empty_clusters] = bundle[random_indices]
 
         centroid_shift = np.linalg.norm(centroids - previous_centroids)
 
