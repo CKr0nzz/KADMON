@@ -29,7 +29,14 @@ expected to use a common RASMM coordinate space.
 
 ```text
 KADMON/
-├── kadmon/        Reusable Python modules, including the shared CUDA backend
+├── kadmon/        Reusable Python modules
+│   ├── io.py            Bundle discovery, validation, and memory-mapped loading
+│   ├── protocol.py      Shared HCP re-identification protocol
+│   ├── reid.py          Per-bundle and aggregate RE-ID metrics
+│   ├── optimization.py  Optuna study creation and resumption
+│   ├── selection.py     Common best-RE-ID trial selection
+│   ├── cpu.py           CPU reference for debiased Sinkhorn
+│   └── gpu.py           Shared CUDA backend
 ├── notebooks/     Interactive analyses, Optuna studies, and bundle data
 │   ├── bundles/   Tractography data organized by subject
 │   └── optuna/    Six compression × transport optimization notebooks
@@ -115,8 +122,11 @@ resolution while retaining strong RE-ID. QuickBundles + Partial OT uses trial
 75 (`threshold=7 mm`, `mass=0.99`, Top-1 `93.55%`, about 296
 representatives). QuickBundles + Sinkhorn uses trial 114 (`threshold=6 mm`,
 `epsilon=0.08744817112699642`, Top-1 `90.32%`, about 538 representatives).
-The notebooks also report the separate best-RE-ID selection based on Top-1,
-mean identity rank, intra/inter ratio, and transported mass.
+All six optimization notebooks use the same recommended RE-ID selection:
+maximize Top-1 accuracy, then minimize mean identity rank and the intra/inter
+ratio, and finally maximize transported mass. The strict minimum of the
+intra/inter objective remains available as a separate diagnostic and may differ
+from the recommended RE-ID trial.
 
 The default K-Means + Partial OT configuration uses the higher-coverage trial
 44: `n_clusters=40` and `mass=0.63`. K-Means + Sinkhorn uses the
@@ -146,6 +156,10 @@ The six studies use the same 31-bundle RE-ID protocol and store their trials in
 QuickBundles and K-Means compression use up to eight CPU workers. Sinkhorn
 trials run sequentially and use the shared PyTorch/POT CUDA backend for MDF,
 self-costs, cross-costs, and entropic transport when GPU validation succeeds.
+Bundle discovery, validation, metric aggregation, trial selection, and Optuna
+study resumption are shared across the six notebooks. Existing studies are
+reopened from SQLite and optimization continues until the configured target
+number of `COMPLETE` trials is reached or the attempt limit is exhausted.
 
 ## Core dependencies
 

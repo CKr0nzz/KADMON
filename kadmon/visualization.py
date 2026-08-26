@@ -2,7 +2,29 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
+
+
+@dataclass(frozen=True)
+class _AnimatedGeometry:
+    """Géométrie nécessaire pour interpoler un acteur FURY."""
+
+    polydata: Any
+    source: np.ndarray
+    projection: np.ndarray
+
+
+@dataclass
+class _AnimationState:
+    """État mutable partagé par les callbacks de l'interface."""
+
+    frame_count: int
+    frame: int = 0
+    playing: bool = False
+    updating_slider: bool = False
 
 
 def _visualization_data(result: dict[str, object]) -> dict[str, np.ndarray]:
@@ -53,7 +75,11 @@ def _add_amplitude_legend(
     """Ajouter l'échelle 2D des déplacements en millimètres."""
     from vtkmodules.vtkCommonCore import vtkPoints
     from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
-    from vtkmodules.vtkRenderingCore import vtkActor2D, vtkPolyDataMapper2D, vtkTextActor
+    from vtkmodules.vtkRenderingCore import (
+        vtkActor2D,
+        vtkPolyDataMapper2D,
+        vtkTextActor,
+    )
 
     def add_text(
         text: str,
@@ -119,26 +145,14 @@ def _add_amplitude_legend(
     )
 
 
-def animate_local_displacements_3d(
-    results: dict[str, object] | dict[str, dict[str, object]],
+def _validate_animation_parameters(
     *,
-    cycle_duration_s: float = 4.0,
-    frames_per_second: int = 30,
-    minimum_visible_displacement_mm: float = 0.0,
-    amplitude_colormap: str = "magma",
-    color_upper_percentile: float = 95.0,
-    interactive: bool = True,
-    size: tuple[int, int] = (1400, 1000),
-):
-    """Animer l'interpolation source-projection des déplacements OT.
-
-    Une période complète effectue un aller-retour. La trajectoire droite est
-    une représentation du vecteur barycentrique OT, et non une trajectoire
-    anatomique ou une déformation physique.
-    """
-    from fury import actor, ui, window
-    from vtkmodules.util.numpy_support import numpy_to_vtk
-
+    cycle_duration_s: float,
+    frames_per_second: int,
+    minimum_visible_displacement_mm: float,
+    color_upper_percentile: float,
+) -> None:
+    """Valider les paramètres numériques de l'animation."""
     if cycle_duration_s <= 0:
         raise ValueError("cycle_duration_s doit être strictement positif.")
     if frames_per_second < 1:
@@ -150,68 +164,85 @@ def animate_local_displacements_3d(
     if not 0 < color_upper_percentile <= 100:
         raise ValueError("color_upper_percentile doit appartenir à ]0, 100].")
 
-    if "barycentric" in results:
-        named_results = {"bundle": results}
-    else:
-        named_results = results
+
+def _prepare_animation_data(
+    results: dict[str, object] | dict[str, dict[str, object]],
+) -> list[dict[str, np.ndarray]]:
+    """Normaliser une fois les résultats et vérifier les déplacements finis."""
+    named_results = {"bundle": results} if "barycentric" in results else results
     if not named_results:
         raise ValueError("Au moins un résultat est requis.")
 
+    prepared = [_visualization_data(result) for result in named_results.values()]
+    finite_displacements = [
+        values[np.isfinite(values)]
+        for data in prepared
+        if (values := data["point_mm"][data["valid"]]).size
+    ]
+    if not finite_displacements or not any(
+        values.size for values in finite_displacements
+    ):
+        raise ValueError("Aucun déplacement fini à afficher.")
+    return prepared
+
+
+def _amplitude_scale(
+    prepared: list[dict[str, np.ndarray]],
+    *,
+    colormap: str,
+    upper_percentile: float,
+):
+    """Construire l'échelle colorimétrique commune aux résultats."""
     import matplotlib.pyplot as plt
     from matplotlib.colors import Normalize
 
-    displacement_values = []
-    for result in named_results.values():
-        data = _visualization_data(result)
-        values = data["point_mm"][data["valid"]]
-        displacement_values.append(values[np.isfinite(values)])
-    finite_displacements = np.concatenate(displacement_values)
-    if not finite_displacements.size:
-        raise ValueError("Aucun déplacement fini à afficher.")
-    upper_mm = float(np.percentile(finite_displacements, color_upper_percentile))
+    finite_displacements = np.concatenate(
+        [
+            values[np.isfinite(values)]
+            for data in prepared
+            if (values := data["point_mm"][data["valid"]]).size
+        ]
+    )
+    upper_mm = float(np.percentile(finite_displacements, upper_percentile))
     limits = (0.0, max(upper_mm, np.finfo(float).eps))
-    amplitude_norm = Normalize(*limits, clip=True)
-    amplitude_cmap = plt.get_cmap(amplitude_colormap)
+    return limits, Normalize(*limits, clip=True), plt.get_cmap(colormap)
 
-    scene = window.Scene()
-    scene.background((0.04, 0.04, 0.06))
+
+def _add_displacement_actors(
+    scene,
+    prepared: list[dict[str, np.ndarray]],
+    *,
+    amplitude_norm,
+    amplitude_cmap,
+    minimum_visible_displacement_mm: float,
+) -> list[_AnimatedGeometry]:
+    """Créer les acteurs et conserver leur géométrie interpolable."""
+    from fury import actor
+
     animated = []
-    for name, result in named_results.items():
-        data = _visualization_data(result)
+    for data in prepared:
         source = data["source_reps"][data["valid"]]
         projection = data["projection"][data["valid"]]
         if not len(source):
             continue
         vectors = projection - source
-        point_mm = np.linalg.norm(vectors, axis=-1)
-        colors = amplitude_cmap(amplitude_norm(point_mm.reshape(-1)))[:, :3]
-        colors[point_mm.reshape(-1) <= minimum_visible_displacement_mm] = 0.0
+        point_mm = np.linalg.norm(vectors, axis=-1).reshape(-1)
+        colors = amplitude_cmap(amplitude_norm(point_mm))[:, :3]
+        colors[point_mm <= minimum_visible_displacement_mm] = 0.0
         moving_actor = actor.line(
-            source,
-            colors=colors,
-            opacity=1.0,
-            linewidth=3.0,
-            lod=False,
+            source, colors=colors, opacity=1.0, linewidth=3.0, lod=False
         )
         scene.add(moving_actor)
-        animated.append((moving_actor.GetMapper().GetInput(), source, vectors))
-
+        animated.append(
+            _AnimatedGeometry(moving_actor.GetMapper().GetInput(), source, projection)
+        )
     if not animated:
         raise ValueError("Aucun représentant source n'a reçu de masse.")
+    return animated
 
-    legend_levels = np.linspace(limits[0], limits[1], 12)
-    legend_colors = amplitude_cmap(amplitude_norm(legend_levels))[:, :3]
-    upper_caption = (
-        "maximum" if color_upper_percentile == 100
-        else f"P{color_upper_percentile:g}"
-    )
-    _add_amplitude_legend(
-        scene,
-        limits,
-        upper_caption,
-        amplitude_colors=legend_colors,
-        viewport_center=size[0] // 2,
-    )
+
+def _create_animation_controls(ui, size: tuple[int, int]):
+    """Créer le slider temporel et le bouton lecture/pause."""
     timeline = ui.LineSlider2D(
         center=(size[0] / 2, 145),
         initial_value=0,
@@ -232,6 +263,127 @@ def animate_local_displacements_3d(
         justification="center", vertical_justification="middle",
         size=(90, 36), color=(1.0, 1.0, 1.0),
     )
+    return timeline, play_button
+
+
+def _configure_animation_callbacks(
+    *,
+    animated: list[_AnimatedGeometry],
+    state: _AnimationState,
+    timeline,
+    play_button,
+    manager,
+    timer_interval_ms: int,
+) -> None:
+    """Relier géométrie, contrôles et timer à l'état de lecture."""
+    from vtkmodules.util.numpy_support import numpy_to_vtk
+
+    def apply_phase(phase: float) -> None:
+        for geometry in animated:
+            positions = np.ascontiguousarray(
+                (
+                    (1.0 - phase) * geometry.source
+                    + phase * geometry.projection
+                ).reshape(-1, 3),
+                dtype=np.float64,
+            )
+            points = geometry.polydata.GetPoints()
+            points.SetData(numpy_to_vtk(positions, deep=True))
+            points.Modified()
+            geometry.polydata.Modified()
+
+    def scrub_animation(slider) -> None:
+        if state.updating_slider:
+            return
+        phase = float(slider.ratio)
+        apply_phase(phase)
+        ascending_angle = np.arccos(np.clip(1.0 - 2.0 * phase, -1.0, 1.0))
+        state.frame = round(ascending_angle * state.frame_count / (2.0 * np.pi))
+        state.playing = False
+        play_button.message = "PLAY"
+        manager.render()
+
+    def toggle_animation(i_ren, _obj, _button) -> None:
+        state.playing = not state.playing
+        play_button.message = "PAUSE" if state.playing else "PLAY"
+        i_ren.event.abort()
+        manager.render()
+
+    def update_animation(_obj, _event) -> None:
+        if not state.playing:
+            return
+        phase = 0.5 - 0.5 * np.cos(2.0 * np.pi * state.frame / state.frame_count)
+        apply_phase(phase)
+        state.updating_slider = True
+        try:
+            timeline.value = 100.0 * phase
+        finally:
+            state.updating_slider = False
+        state.frame = (state.frame + 1) % state.frame_count
+        manager.render()
+
+    timeline.on_change = scrub_animation
+    play_button.on_left_mouse_button_clicked = toggle_animation
+    manager.add_timer_callback(True, timer_interval_ms, update_animation)
+
+
+def animate_local_displacements_3d(
+    results: dict[str, object] | dict[str, dict[str, object]],
+    *,
+    cycle_duration_s: float = 4.0,
+    frames_per_second: int = 30,
+    minimum_visible_displacement_mm: float = 0.0,
+    amplitude_colormap: str = "magma",
+    color_upper_percentile: float = 95.0,
+    interactive: bool = True,
+    size: tuple[int, int] = (1400, 1000),
+):
+    """Animer l'interpolation source-projection des déplacements OT.
+
+    Une période complète effectue un aller-retour. La trajectoire droite est
+    obtenue par interpolation linéaire entre chaque représentant source et sa
+    projection barycentrique. Elle représente le vecteur barycentrique OT, et
+    non une trajectoire anatomique ou une déformation physique.
+    """
+    from fury import ui, window
+
+    _validate_animation_parameters(
+        cycle_duration_s=cycle_duration_s,
+        frames_per_second=frames_per_second,
+        minimum_visible_displacement_mm=minimum_visible_displacement_mm,
+        color_upper_percentile=color_upper_percentile,
+    )
+    prepared = _prepare_animation_data(results)
+    limits, amplitude_norm, amplitude_cmap = _amplitude_scale(
+        prepared,
+        colormap=amplitude_colormap,
+        upper_percentile=color_upper_percentile,
+    )
+
+    scene = window.Scene()
+    scene.background((0.04, 0.04, 0.06))
+    animated = _add_displacement_actors(
+        scene,
+        prepared,
+        amplitude_norm=amplitude_norm,
+        amplitude_cmap=amplitude_cmap,
+        minimum_visible_displacement_mm=minimum_visible_displacement_mm,
+    )
+
+    legend_levels = np.linspace(limits[0], limits[1], 12)
+    legend_colors = amplitude_cmap(amplitude_norm(legend_levels))[:, :3]
+    upper_caption = (
+        "maximum" if color_upper_percentile == 100
+        else f"P{color_upper_percentile:g}"
+    )
+    _add_amplitude_legend(
+        scene,
+        limits,
+        upper_caption,
+        amplitude_colors=legend_colors,
+        viewport_center=size[0] // 2,
+    )
+    timeline, play_button = _create_animation_controls(ui, size)
     scene.reset_camera()
     manager = window.ShowManager(
         scene=scene,
@@ -251,58 +403,16 @@ def animate_local_displacements_3d(
     )
     scene.add(timeline)
     scene.add(play_button)
-    frame_count = max(2, round(cycle_duration_s * frames_per_second))
-    state = {"frame": 0, "playing": False, "updating_slider": False}
-
-    def apply_phase(phase: float) -> None:
-        for polydata, source, vectors in animated:
-            positions = np.ascontiguousarray(
-                (source + phase * vectors).reshape(-1, 3), dtype=np.float64,
-            )
-            polydata.GetPoints().SetData(numpy_to_vtk(positions, deep=True))
-            polydata.GetPoints().Modified()
-            polydata.Modified()
-
-    def scrub_animation(slider) -> None:
-        if state["updating_slider"]:
-            return
-        phase = float(slider.ratio)
-        apply_phase(phase)
-        ascending_angle = np.arccos(np.clip(1.0 - 2.0 * phase, -1.0, 1.0))
-        state["frame"] = round(ascending_angle * frame_count / (2.0 * np.pi))
-        state["playing"] = False
-        play_button.message = "PLAY"
-        manager.render()
-
-    timeline.on_change = scrub_animation
-
-    def toggle_animation(i_ren, _obj, _button) -> None:
-        state["playing"] = not state["playing"]
-        play_button.message = "PAUSE" if state["playing"] else "PLAY"
-        i_ren.event.abort()
-        manager.render()
-
-    play_button.on_left_mouse_button_clicked = toggle_animation
-
-    def update_animation(_obj, _event) -> None:
-        if not state["playing"]:
-            return
-        phase = 0.5 - 0.5 * np.cos(
-            2.0 * np.pi * state["frame"] / frame_count
-        )
-        apply_phase(phase)
-        state["updating_slider"] = True
-        try:
-            timeline.value = 100.0 * phase
-        finally:
-            state["updating_slider"] = False
-        state["frame"] = (state["frame"] + 1) % frame_count
-        manager.render()
-
-    manager.add_timer_callback(
-        True,
-        max(1, round(1000 / frames_per_second)),
-        update_animation,
+    state = _AnimationState(
+        frame_count=max(2, round(cycle_duration_s * frames_per_second))
+    )
+    _configure_animation_callbacks(
+        animated=animated,
+        state=state,
+        timeline=timeline,
+        play_button=play_button,
+        manager=manager,
+        timer_interval_ms=max(1, round(1000 / frames_per_second)),
     )
     manager.render()
     print("Animation OT : 0 % = source; 100 % = projection barycentrique.")
@@ -310,7 +420,10 @@ def animate_local_displacements_3d(
         f"La couleur code l'amplitude 0–{limits[1]:.2f} mm "
         f"({upper_caption}); la direction est portée par l'animation."
     )
-    print("Le bouton PLAY/PAUSE contrôle l'animation; déplacer le slider la met en pause.")
+    print(
+        "Le bouton PLAY/PAUSE contrôle l'animation; "
+        "déplacer le slider la met en pause."
+    )
     if interactive:
         manager.start()
     return scene, manager
