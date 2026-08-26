@@ -3,9 +3,10 @@
 Ce module contient uniquement les primitives numériques communes aux études
 Optuna. La compression et l'orchestration des essais restent dans les
 notebooks, puisqu'elles diffèrent entre K-Means et le binning.
-"""
 
-from __future__ import annotations
+Flux : représentants -> coûts MDF -> divergence Sinkhorn -> plan et métriques.
+La référence CPU vit séparément dans ``kadmon.cpu``.
+"""
 
 import gc
 from collections.abc import MutableMapping
@@ -13,10 +14,8 @@ from typing import Any
 
 import numpy as np
 import torch
-from dipy.tracking.distances import bundles_distances_mdf
 
 from .barycentric import compute_barycentric_projection, displacement_statistics
-from .transport import _compute_pair_sinkhorn_scale, compute_transport
 
 
 GpuSelfCostCache = MutableMapping[int, tuple[torch.Tensor, torch.Tensor]]
@@ -34,7 +33,7 @@ def compute_mdf_cost_matrix_gpu(
     if batch_size < 1:
         raise ValueError("batch_size doit être positif.")
     if source.ndim != 3 or target.ndim != 3 or source.shape[1:] != target.shape[1:]:
-        raise ValueError("Les représentants GPU doivent avoir la forme (N, P, 3).")
+        raise ValueError("Les représentants GPU doivent avoir la forme (S, P, 3).")
 
     result = torch.empty(
         (len(source), len(target)), dtype=source.dtype, device=source.device
@@ -69,6 +68,7 @@ def positive_p95_gpu(
         flat = matrix.detach().reshape(-1)
         step = max(
             1,
+            # flat.numel() = nombre total d'éléments
             (flat.numel() + max_samples_per_matrix - 1)
             // max_samples_per_matrix,
         )
@@ -84,7 +84,7 @@ def positive_p95_gpu(
     )
 
 
-def _sinkhorn_cost_gpu(
+def _solve_sinkhorn_gpu(
     source_weights: torch.Tensor,
     target_weights: torch.Tensor,
     cost: torch.Tensor,
@@ -120,7 +120,7 @@ def _sinkhorn_cost_gpu(
     return value, None
 
 
-def compute_sinkhorn_gpu(
+def compute_sinkhorn_divergence_gpu(
     source_weights: np.ndarray,
     target_weights: np.ndarray,
     cross_cost: torch.Tensor,
@@ -138,20 +138,56 @@ def compute_sinkhorn_gpu(
 
     # Les auto-coûts ne produisent pas de plan; les résoudre d'abord limite le
     # nombre de grands tableaux vivants lorsque le plan croisé est construit.
-    source_value, _ = _sinkhorn_cost_gpu(
-        source, source, source_self_cost / scale, parameters, return_plan=False
+    source_value, _ = _solve_sinkhorn_gpu(
+        source_weights=source,
+        target_weights=source,
+        cost=source_self_cost / scale,
+        parameters=parameters,
+        return_plan=False,
     )
-    target_value, _ = _sinkhorn_cost_gpu(
-        target, target, target_self_cost / scale, parameters, return_plan=False
+    target_value, _ = _solve_sinkhorn_gpu(
+        source_weights=target,
+        target_weights=target,
+        cost=target_self_cost / scale,
+        parameters=parameters,
+        return_plan=False,
     )
-    cross_value, plan = _sinkhorn_cost_gpu(
-        source, target, cross_cost / scale, parameters, return_plan=True
+    cross_value, plan = _solve_sinkhorn_gpu(
+        source_weights=source,
+        target_weights=target,
+        cost=cross_cost / scale,
+        parameters=parameters,
+        return_plan=True,
     )
     assert plan is not None
     divergence = torch.clamp(
         cross_value - 0.5 * source_value - 0.5 * target_value, min=0
     )
     return divergence, plan
+
+
+def _tensor_and_self_cost_gpu(
+    representatives: np.ndarray,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    batch_size: int,
+    cache: GpuSelfCostCache | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transférer des représentants et obtenir leur matrice MDF propre."""
+    key = id(representatives)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    tensor = torch.as_tensor(representatives, dtype=dtype, device=device)
+    self_cost = compute_mdf_cost_matrix_gpu(
+        tensor,
+        tensor,
+        batch_size=batch_size,
+    )
+    if cache is not None:
+        cache[key] = (tensor, self_cost)
+    return tensor, self_cost
 
 
 def _check_gpu_memory(
@@ -203,38 +239,48 @@ def evaluate_pair_gpu(
         memory_fraction=memory_fraction,
     )
 
-    cache = self_cost_cache
-
-    def tensor_and_self_cost(representatives: np.ndarray):
-        key = id(representatives)
-        if cache is not None and key in cache:
-            return cache[key]
-        tensor = torch.as_tensor(representatives, dtype=dtype, device=device)
-        self_cost = compute_mdf_cost_matrix_gpu(
-            tensor, tensor, batch_size=batch_size
-        )
-        if cache is not None:
-            cache[key] = (tensor, self_cost)
-        return tensor, self_cost
-
-    source, source_self = tensor_and_self_cost(source_reps)
-    target, target_self = tensor_and_self_cost(target_reps)
-    cross = compute_mdf_cost_matrix_gpu(source, target, batch_size=batch_size)
-    objective, plan_gpu = compute_sinkhorn_gpu(
-        source_weights, target_weights, cross, source_self, target_self, parameters
+    source, source_self_cost = _tensor_and_self_cost_gpu(
+        source_reps,
+        dtype=dtype,
+        device=device,
+        batch_size=batch_size,
+        cache=self_cost_cache,
+    )
+    target, target_self_cost = _tensor_and_self_cost_gpu(
+        target_reps,
+        dtype=dtype,
+        device=device,
+        batch_size=batch_size,
+        cache=self_cost_cache,
+    )
+    cross_cost = compute_mdf_cost_matrix_gpu(
+        source,
+        target,
+        batch_size=batch_size,
+    )
+    objective, plan_gpu = compute_sinkhorn_divergence_gpu(
+        source_weights=source_weights,
+        target_weights=target_weights,
+        cross_cost=cross_cost,
+        source_self_cost=source_self_cost,
+        target_self_cost=target_self_cost,
+        parameters=parameters,
     )
     if log:
         print(
-            f"[GPU] Cost matrix: shape={tuple(cross.shape)}, dtype={cross.dtype}\n"
+            f"[GPU] Cost matrix: shape={tuple(cross_cost.shape)}, "
+            f"dtype={cross_cost.dtype}\n"
             "[GPU] OT backend: PyTorch/POT"
         )
 
     global_distance_mm = float(
-        (torch.sum(plan_gpu * cross) / torch.sum(plan_gpu)).detach().cpu()
+        (torch.sum(plan_gpu * cross_cost) / torch.sum(plan_gpu)).detach().cpu()
     )
     plan = plan_gpu.detach().cpu().numpy().astype(np.float64)
     cost = (
-        cross.detach().cpu().numpy().astype(np.float64) if return_cost else None
+        cross_cost.detach().cpu().numpy().astype(np.float64)
+        if return_cost
+        else None
     )
     projection = compute_barycentric_projection(source_reps, target_reps, plan)
     statistics = displacement_statistics(
@@ -249,88 +295,10 @@ def evaluate_pair_gpu(
         "mean_mm": float(statistics["mean_mm"]),
         "mass": float(plan.sum()),
     }
-    if cache is None:
-        del source, target, source_self, target_self
-    del cross, plan_gpu, plan, projection, objective
+    if self_cost_cache is None:
+        del source, target, source_self_cost, target_self_cost
+    del cross_cost, plan_gpu, plan, projection, objective
     return result
-
-
-def available_ram_bytes() -> int:
-    """Retourner la mémoire RAM disponible sous Linux, ou zéro."""
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as stream:
-            fields = {
-                line.split(":", 1)[0]: int(line.split()[1]) * 1024
-                for line in stream
-                if ":" in line
-            }
-        return fields.get("MemAvailable", 0)
-    except OSError:
-        return 0
-
-
-def evaluate_pair_cpu(
-    source_distribution: tuple[np.ndarray, np.ndarray],
-    target_distribution: tuple[np.ndarray, np.ndarray],
-    parameters: dict[str, Any],
-    *,
-    memory_fraction: float | None = None,
-) -> dict[str, object]:
-    """Référence CPU commune servant aussi de fallback et de validation."""
-    source_reps, source_weights = source_distribution
-    target_reps, target_weights = target_distribution
-    if memory_fraction is not None:
-        if not 0 < memory_fraction <= 1:
-            raise ValueError("memory_fraction doit appartenir à ]0, 1].")
-        matrix_elements = (
-            len(source_reps) ** 2
-            + len(target_reps) ** 2
-            + len(source_reps) * len(target_reps)
-        )
-        required = 8 * np.dtype(np.float64).itemsize * matrix_elements
-        available = available_ram_bytes()
-        if available and required > memory_fraction * available:
-            raise MemoryError(
-                "Comparaison CPU refusée: "
-                f"pic estimé={required / 2**30:.2f} Gio, "
-                f"disponible={available / 2**30:.2f} Gio"
-            )
-
-    cross = np.asarray(
-        bundles_distances_mdf(source_reps, target_reps), dtype=np.float64
-    )
-    source_self = np.asarray(
-        bundles_distances_mdf(source_reps, source_reps), dtype=np.float64
-    )
-    target_self = np.asarray(
-        bundles_distances_mdf(target_reps, target_reps), dtype=np.float64
-    )
-    scale = _compute_pair_sinkhorn_scale(cross, source_self, target_self)
-    transport = compute_transport(
-        source_weights,
-        target_weights,
-        cross,
-        "sinkhorn",
-        **parameters,
-        source_self_cost_matrix=source_self,
-        target_self_cost_matrix=target_self,
-        cost_scale=scale,
-    )
-    plan = np.asarray(transport["transport_plan"])
-    projection = compute_barycentric_projection(source_reps, target_reps, plan)
-    statistics = displacement_statistics(
-        np.asarray(projection["representative_distance_mm"]),
-        np.asarray(projection["row_mass"]),
-    )
-    mass = float(plan.sum())
-    return {
-        "cost": cross,
-        "weights": (source_weights, target_weights),
-        "objective": float(transport["distance"]),
-        "global_distance_mm": float(np.sum(plan * cross) / mass),
-        "mean_mm": float(statistics["mean_mm"]),
-        "mass": mass,
-    }
 
 
 def release_gpu_memory() -> None:

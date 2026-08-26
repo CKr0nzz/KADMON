@@ -51,6 +51,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install numpy scipy scikit-learn dipy POT tractosearch lpqtree
 python -m pip install pandas jupyterlab joblib optuna plotly
+python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
 TractoSearch is required for bundle binning. When working from a local
@@ -66,10 +67,12 @@ Install the optional visualization stack with:
 python -m pip install fury vtk
 ```
 
-The Sinkhorn Optuna studies can use the shared CUDA backend. Install a PyTorch
-build compatible with the local CUDA runtime to enable it. Each Sinkhorn
-notebook validates its GPU results against the CPU implementation before using
-CUDA and falls back explicitly to CPU if validation or CUDA availability fails.
+PyTorch is required by the Sinkhorn Optuna notebooks, including for their CPU
+fallback. The command above installs its CPU build. To enable the shared CUDA
+backend, install instead a PyTorch build compatible with the local NVIDIA
+driver. Each Sinkhorn notebook validates its GPU results against the CPU
+implementation before using CUDA and falls back explicitly to CPU if validation
+or CUDA availability fails.
 
 The repository itself is not installed as a Python package.
 
@@ -151,7 +154,7 @@ self-costs, cross-costs, and entropic transport when GPU validation succeeds.
 - **DIPY** — tractography I/O, resampling, and MDF distances
 - **DIPY QuickBundles** — tractography-specific compression baseline
 - **POT** — optimal-transport solvers
-- **PyTorch** — optional CUDA acceleration of MDF and Sinkhorn
+- **PyTorch** — Sinkhorn backend, with optional CUDA acceleration
 - **scikit-learn** — KDTree-based operations
 - **TractoSearch** (required) and **lpqtree** — streamline binning utilities
 - **FURY** and **VTK** — optional 3D visualization
