@@ -29,17 +29,21 @@ expected to use a common RASMM coordinate space.
 
 ```text
 KADMON/
-├── kadmon/        Reusable Python modules
-│   ├── io.py            Bundle discovery, validation, and memory-mapped loading
-│   ├── protocol.py      Shared HCP re-identification protocol
-│   ├── reid.py          Per-bundle and aggregate RE-ID metrics
-│   ├── optimization.py  Optuna study creation and resumption
-│   ├── selection.py     Common best-RE-ID trial selection
-│   ├── cpu.py           CPU reference for debiased Sinkhorn
-│   └── gpu.py           Shared CUDA backend
-├── notebooks/     Interactive analyses, Optuna studies, and bundle data
-│   ├── bundles/   Tractography data organized by subject
-│   └── optuna/    Six compression × transport optimization notebooks
+├── kadmon/
+│   ├── comparison.py, compression.py, transport.py  Core OT pipeline
+│   ├── barycentric.py, visualization.py              Mapping and figures
+│   ├── io.py, defaults.py                            Data and defaults
+│   ├── protocol.py, reid.py, selection.py            RE-ID protocol
+│   ├── optimization.py                               Optuna orchestration
+│   └── cpu.py, gpu.py                                Numerical backends
+├── notebooks/
+│   ├── 1_Comparer_Techniques_OT.ipynb
+│   ├── 2_Visualiser_Deplacements_3D.ipynb
+│   ├── 3_Exporter_Representants_OT_Alignes.ipynb
+│   ├── bundles/          Tractography data by acquisition
+│   ├── centroids_export/ Exported aligned representatives
+│   └── optuna/           Six compression × transport studies
+├── .gitignore
 └── README.md
 ```
 
